@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dental Appointment Bot</title>
+
+<!--
+  ========================================================================
+  Lab 6 - Amazon Lex chatbot web client
+  Replaces the Vocareum-hosted index.html download.
+
+  >>> EDIT THE FOUR VALUES IN THE CONFIG BLOCK BELOW, THEN UPLOAD TO S3 <<<
+
+  Uses the AWS SDK for JavaScript v2 browser bundle. v2 is in maintenance
+  mode, but it is the only build that drops into a static page with no
+  bundler - which is exactly what this lab needs. SDK v3 is modular and
+  expects a build step (webpack/vite), so it is not usable as a single
+  file on S3 without tooling.
+  ========================================================================
+-->
+
+<script src="https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js"></script>
+
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --ink: #16191f;
+    --muted: #5f6b7a;
+    --line: #d5dbdb;
+    --bot: #eef1f6;
+    --user: #0972d3;
+    --accent: #0972d3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .chat {
+    width: 100%; max-width: 460px; height: min(680px, 92vh);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.08);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    padding: 14px 18px; border-bottom: 1px solid var(--line);
+    background: var(--accent); color: #fff;
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header p  { margin: 2px 0 0; font-size: 12px; opacity: .85; }
+
+  #log { flex: 1; overflow-y: auto; padding: 16px; }
+  .msg { display: flex; margin-bottom: 10px; }
+  .msg .bubble {
+    max-width: 78%; padding: 9px 13px; border-radius: 14px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .msg.bot  .bubble { background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .bubble { background: var(--user); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.err  .bubble { background: #fdf3f1; color: #b3261e; border: 1px solid #f2c9c2; font-size: 13px; }
+
+  .typing span {
+    display: inline-block; width: 6px; height: 6px; margin-right: 3px;
+    background: var(--muted); border-radius: 50%; animation: blink 1.2s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%,80%,100% { opacity:.25 } 40% { opacity:1 } }
+
+  form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+  input[type=text] {
+    flex: 1; padding: 10px 12px; font-size: 15px;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 10px 18px; font-size: 15px; font-weight: 600; color: #fff;
+    background: var(--accent); border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { background: #9bb7d4; cursor: not-allowed; }
+
+  .hint { padding: 0 16px 12px; font-size: 12px; color: var(--muted); }
+  .hint code { background: var(--bot); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div class="chat">
+  <header>
+    <h1>Dental Appointment Bot</h1>
+    <p>Powered by Amazon Lex</p>
+  </header>
+
+  <div id="log"></div>
+
+  <div class="hint">
+    Try: <code>I would like to make an appointment</code>
+  </div>
+
+  <form id="form" autocomplete="off">
+    <input type="text" id="input" placeholder="Type a message..." required>
+    <button type="submit" id="send">Send</button>
+  </form>
+</div>
+
+<script>
+// ===========================================================================
+//  CONFIG - replace all four values, then save and upload to S3
+// ===========================================================================
+var CONFIG = {
+  // Cognito → Identity pools → your pool → Identity pool ID
+  // Looks like: us-east-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  identityPoolId: 'us-east-1:REPLACE-WITH-YOUR-IDENTITY-POOL-ID',
+
+  // Lex → Bots → ScheduleAppointment → Bot ID (10 characters, e.g. ABCDEFGHIJ)
+  botId: 'REPLACE-WITH-YOUR-BOT-ID',
+
+  // Lex → your bot → Aliases → TestBotAlias → Alias ID (often TSTALIASID)
+  botAliasId: 'TSTALIASID',
+
+  // Must match the region your bot and identity pool are in
+  region: 'us-east-1',
+
+  localeId: 'en_US'
+};
+// ===========================================================================
+
+var log = document.getElementById('log');
+var form = document.getElementById('form');
+var input = document.getElementById('input');
+var sendBtn = document.getElementById('send');
+
+// One session id per page load, so each visitor gets their own conversation
+var sessionId = 'web-' + Math.random().toString(36).slice(2, 12);
+
+function addMessage(text, who) {
+  var wrap = document.createElement('div');
+  wrap.className = 'msg ' + who;
+  var bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+  return wrap;
+}
+
+function addTyping() {
+  var wrap = document.createElement('div');
+  wrap.className = 'msg bot';
+  wrap.innerHTML = '<div class="bubble typing"><span></span><span></span><span></span></div>';
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+  return wrap;
+}
+
+// --- Check the config was actually filled in --------------------------------
+var unset = [];
+if (CONFIG.identityPoolId.indexOf('REPLACE') !== -1) unset.push('identityPoolId');
+if (CONFIG.botId.indexOf('REPLACE') !== -1) unset.push('botId');
+
+if (unset.length) {
+  addMessage(
+    'Configuration incomplete.\n\nStill to set: ' + unset.join(', ') +
+    '\n\nEdit the CONFIG block near the bottom of index.html, then re-upload ' +
+    'the file to your S3 bucket.', 'err');
+  input.disabled = true;
+  sendBtn.disabled = true;
+} else {
+  initBot();
+}
+
+function initBot() {
+  var lex;
+  try {
+    AWS.config.region = CONFIG.region;
+    AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+      IdentityPoolId: CONFIG.identityPoolId
+    });
+    lex = new AWS.LexRuntimeV2({
+      region: CONFIG.region,
+      apiVersion: '2020-08-07'
+    });
+  } catch (e) {
+    addMessage('Could not initialise the AWS SDK: ' + e.message, 'err');
+    return;
+  }
+
+  addMessage("Hello. I can book a cleaning, a root canal, or a whitening. " +
+             "How can I help?", 'bot');
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var text = input.value.trim();
+    if (!text) return;
+
+    addMessage(text, 'user');
+    input.value = '';
+    sendBtn.disabled = true;
+    var typing = addTyping();
+
+    lex.recognizeText({
+      botId: CONFIG.botId,
+      botAliasId: CONFIG.botAliasId,
+      localeId: CONFIG.localeId,
+      sessionId: sessionId,
+      text: text
+    }, function (err, data) {
+      typing.remove();
+      sendBtn.disabled = false;
+      input.focus();
+
+      if (err) {
+        console.error(err);
+        var hint = '';
+        if (err.code === 'AccessDeniedException' ||
+            err.code === 'NotAuthorizedException') {
+          hint = '\n\nThe Cognito identity pool\'s unauthenticated role ' +
+                 'probably lacks lex:RecognizeText. See Task 5 of the guide.';
+        } else if (err.code === 'ResourceNotFoundException') {
+          hint = '\n\nCheck botId, botAliasId and region in the CONFIG block. ' +
+                 'The bot must also be BUILT before it can be called.';
+        }
+        addMessage(err.code + ': ' + err.message + hint, 'err');
+        return;
+      }
+
+      if (data.messages && data.messages.length) {
+        data.messages.forEach(function (m) { addMessage(m.content, 'bot'); });
+      } else {
+        // Lex can legitimately return no message when the Lambda delegates
+        addMessage('(no reply - check the Lambda is attached to the alias)', 'err');
+      }
+    });
+  });
+}
+</script>
+</body>
+</html>
